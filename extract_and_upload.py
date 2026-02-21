@@ -10,8 +10,12 @@ import re
 import sys
 import glob
 import subprocess
+import time
 from pathlib import Path
 from datetime import datetime
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+from collections import defaultdict
 
 # 腳本所在目錄 = github 資料夾
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,6 +23,66 @@ TXT_PATTERN = str(BASE_DIR / "Yahoo序號連結查詢結果_*.txt")
 OUTPUT_HTML = BASE_DIR / "Telegram獎品網址整理.html"
 OUTPUT_TXT = BASE_DIR / "Telegram獎品網址清單.txt"
 OUTPUT_COUPON = BASE_DIR / "allmysteven.html"  # 電子券清單（與 Telegram 獎品同步）
+EXPIRY_CACHE = BASE_DIR / "expiry_cache.txt"   # 兌換期間至快取（url -> 日期）
+
+
+def fetch_expiry_date(url):
+    """從 txp.rs 兌換券頁面爬取「兌換期間至」日期。"""
+    if "txp.rs" not in url:
+        return None
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        with urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        m = re.search(r"兌換期間至[\s\S]*?([\d]{4}\.[\d]{2}\.[\d]{2})", html)
+        if m:
+            return m.group(1).strip()
+    except (URLError, HTTPError, Exception) as e:
+        pass
+    return None
+
+
+def load_expiry_cache():
+    """載入兌換期間至快取。"""
+    cache = {}
+    if EXPIRY_CACHE.exists():
+        try:
+            for line in EXPIRY_CACHE.read_text(encoding="utf-8").strip().split("\n"):
+                if "\t" in line:
+                    url, date = line.split("\t", 1)
+                    cache[url.strip()] = date.strip()
+        except Exception:
+            pass
+    return cache
+
+
+def save_expiry_cache(cache):
+    """儲存兌換期間至快取。"""
+    lines = [f"{url}\t{date}" for url, date in sorted(cache.items())]
+    EXPIRY_CACHE.write_text("\n".join(lines), encoding="utf-8")
+
+
+def enrich_prizes_with_expiry(entries, verbose=True):
+    """為每個獎品補充兌換期間至，使用快取避免重複請求。"""
+    cache = load_expiry_cache()
+    updated = False
+    for rec in entries:
+        for p in rec["prizes"]:
+            url = p["link"].strip()
+            if url in cache:
+                p["expiry"] = cache[url]
+            else:
+                expiry = fetch_expiry_date(url)
+                p["expiry"] = expiry if expiry else ""
+                if expiry:
+                    cache[url] = expiry
+                    updated = True
+                if verbose and "txp.rs" in url:
+                    print(f"  取得兌換期間: {p['title'][:20]}... -> {p['expiry']}")
+                time.sleep(0.5)  # 避免請求過快
+    if updated:
+        save_expiry_cache(cache)
+    return entries
 
 
 def parse_telegram_section(content):
@@ -77,31 +141,32 @@ def collect_all_prizes():
 
 def build_html(entries):
     """產生整理後的 HTML 頁面（所有網址彙總）。"""
-    rows = []
-    total_count = 0
-    seen_urls = set()  # 去重（同一網址可能在不同日期出現）
-
+    flat = []
+    seen_urls = set()
     for rec in entries:
         send_date = rec["send_date"]
-        prizes = rec["prizes"]
-        if not prizes:
-            continue
-        for p in prizes:
+        for p in rec["prizes"]:
             if p["link"] in seen_urls:
                 continue
             seen_urls.add(p["link"])
-            total_count += 1
+            flat.append({**p, "send_date": send_date})
+    flat = _sort_and_group_prizes(flat)
+    has_any_expiry = any(p.get("expiry") for p in flat)
+    total_count = len(flat)
+    rows = []
+    for i, p in enumerate(flat, 1):
+        send_date = p.get("send_date", "")
+        if has_any_expiry:
             rows.append(
-                f"""
-                <tr>
-                    <td>{total_count}</td>
-                    <td>{p['title']}</td>
-                    <td>{send_date}</td>
-                    <td>{p['time']}</td>
-                    <td>Profile {p['profile']}</td>
-                    <td><a href="{p['link']}" target="_blank" rel="noopener">開啟</a></td>
-                </tr>
-                """
+                f"<tr><td>{i}</td><td>{p['title']}</td><td>{p.get('expiry') or ''}</td>"
+                f"<td>{send_date}</td><td>{p['time']}</td><td>Profile {p['profile']}</td>"
+                f'<td><a href="{p["link"]}" target="_blank" rel="noopener">開啟</a></td></tr>'
+            )
+        else:
+            rows.append(
+                f"<tr><td>{i}</td><td>{p['title']}</td>"
+                f"<td>{send_date}</td><td>{p['time']}</td><td>Profile {p['profile']}</td>"
+                f'<td><a href="{p["link"]}" target="_blank" rel="noopener">開啟</a></td></tr>'
             )
 
     html = f"""<!DOCTYPE html>
@@ -125,10 +190,10 @@ def build_html(entries):
 </head>
 <body>
     <h1>📱 發送到 Telegram 的獎品 📱</h1>
-    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}｜共 {len(entries)} 個查詢日、{total_count} 筆獎項網址</p>
+    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}｜共 {len(entries)} 個查詢日、{total_count} 筆獎項網址（同類型、依到期日排序）</p>
     <div class="table-wrap">
         <table>
-            <thead><tr><th>#</th><th>標題</th><th>發送日期</th><th>時間</th><th>Profile</th><th>連結</th></tr></thead>
+            <thead><tr><th>#</th><th>標題</th>{'<th>兌換期間至</th>' if has_any_expiry else ''}<th>發送日期</th><th>時間</th><th>Profile</th><th>連結</th></tr></thead>
             <tbody>
                 {''.join(rows)}
             </tbody>
@@ -140,22 +205,53 @@ def build_html(entries):
     return html
 
 
+def _sort_and_group_prizes(flat):
+    """同類型放一起，依到期日由近到遠排序。"""
+    groups = defaultdict(list)
+    for p in flat:
+        groups[p["title"]].append(p)
+    # 每組內依到期日排序（無到期日的放最後）
+    FAR = "9999.99.99"
+    for title in groups:
+        groups[title].sort(key=lambda p: p.get("expiry") or FAR)
+    # 各組依「該組最早到期日」排序，到期日近的組排前面
+    def group_min_expiry(items):
+        expiries = [p.get("expiry") for p in items if p.get("expiry")]
+        return min(expiries) if expiries else FAR
+    sorted_pairs = sorted(groups.items(), key=lambda x: group_min_expiry(x[1]))
+    result = []
+    for title, items in sorted_pairs:
+        result.extend(items)
+    return result
+
+
 def build_allmysteven_html(entries):
-    """產生電子券清單 allmysteven.html（品項、發送日期、使用連結）。"""
-    rows = []
-    total_count = 0
+    """產生電子券清單 allmysteven.html（品項、兌換期間至、使用連結）。"""
+    flat = []
     seen_urls = set()
     for rec in entries:
-        send_date = rec["send_date"]
         for p in rec["prizes"]:
             if p["link"] in seen_urls:
                 continue
             seen_urls.add(p["link"])
-            total_count += 1
+            flat.append(p)
+    flat = _sort_and_group_prizes(flat)
+    has_any_expiry = any(p.get("expiry") for p in flat)
+    rows = []
+    for i, p in enumerate(flat, 1):
+        expiry = p.get("expiry") or ""
+        if has_any_expiry:
             rows.append(
-                f'<tr><td>{total_count}</td><td>{p["title"]}</td><td>{send_date}</td>'
+                f'<tr><td>{i}</td><td>{p["title"]}</td><td>{expiry}</td>'
                 f'<td><a href="{p["link"]}" target="_blank" rel="noopener" class="btn">使用</a></td></tr>'
             )
+        else:
+            rows.append(
+                f'<tr><td>{i}</td><td>{p["title"]}</td>'
+                f'<td><a href="{p["link"]}" target="_blank" rel="noopener" class="btn">使用</a></td></tr>'
+            )
+    th_expiry = '<th>兌換期間至</th>' if has_any_expiry else ''
+    thead = f'<tr><th>#</th><th>品項名稱</th>{th_expiry}<th>操作</th></tr>'
     html = f"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -178,10 +274,10 @@ def build_allmysteven_html(entries):
     <h1>🎟️ 我的電子商品券</h1>
     <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
     <table>
-        <thead><tr><th>#</th><th>品項名稱</th><th>發送日期</th><th>操作</th></tr></thead>
+        <thead>{thead}</thead>
         <tbody>{''.join(rows)}</tbody>
     </table>
-    <p class="summary">目前共有商品券：{total_count} 張</p>
+    <p class="summary">目前共有商品券：{len(flat)} 張</p>
 </body>
 </html>
 """
@@ -230,6 +326,17 @@ def main():
     print(f"共 {len(entries)} 個日期的 Telegram 獎項區塊。")
     total_prizes = sum(len(e["prizes"]) for e in entries)
     print(f"獎項總筆數: {total_prizes}")
+
+    skip_fetch = "--no-fetch" in sys.argv
+    if skip_fetch:
+        print("略過爬取兌換期間至（僅用快取）。")
+        cache = load_expiry_cache()
+        for rec in entries:
+            for p in rec["prizes"]:
+                p["expiry"] = cache.get(p["link"].strip(), "")
+    else:
+        print("正在爬取兌換期間至（首次較慢，之後會用快取）...")
+        entries = enrich_prizes_with_expiry(entries, verbose=False)
 
     html = build_html(entries)
     OUTPUT_HTML.write_text(html, encoding="utf-8")
