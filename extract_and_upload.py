@@ -26,31 +26,39 @@ OUTPUT_COUPON = BASE_DIR / "allmysteven.html"  # 電子券清單（與 Telegram 
 EXPIRY_CACHE = BASE_DIR / "expiry_cache.txt"   # 兌換期間至快取（url -> 日期）
 
 
-def fetch_expiry_date(url):
-    """從 txp.rs 兌換券頁面爬取「兌換期間至」日期。"""
+def fetch_voucher_info(url):
+    """從 txp.rs 兌換券頁面爬取：兌換期間至、是否已使用。"""
     if "txp.rs" not in url:
-        return None
+        return None, ""
     try:
         req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
         with urlopen(req, timeout=15) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
+        expiry = None
         m = re.search(r"兌換期間至[\s\S]*?([\d]{4}\.[\d]{2}\.[\d]{2})", html)
         if m:
-            return m.group(1).strip()
-    except (URLError, HTTPError, Exception) as e:
+            expiry = m.group(1).strip()
+        # 判斷已使用：Edenred 用 CSS class「stamp usededn」或「StatusOverlayBg」顯示已使用圖章
+        # （「已使用」是圖示，不在 HTML 文字中）
+        used = "已兌換" if ("usededn" in html or "StatusOverlayBg" in html) else ""
+        return expiry, used
+    except (URLError, HTTPError, Exception):
         pass
-    return None
+    return None, ""
 
 
 def load_expiry_cache():
-    """載入兌換期間至快取。"""
-    cache = {}
+    """載入兌換期間至快取（格式：url\texpiry 或 url\texpiry\tstatus）。"""
+    cache = {}  # url -> (expiry, status)
     if EXPIRY_CACHE.exists():
         try:
             for line in EXPIRY_CACHE.read_text(encoding="utf-8").strip().split("\n"):
                 if "\t" in line:
-                    url, date = line.split("\t", 1)
-                    cache[url.strip()] = date.strip()
+                    parts = line.split("\t", 2)
+                    url = parts[0].strip()
+                    expiry = parts[1].strip() if len(parts) > 1 else ""
+                    status = parts[2].strip() if len(parts) > 2 else ""
+                    cache[url] = (expiry, status)
         except Exception:
             pass
     return cache
@@ -58,27 +66,35 @@ def load_expiry_cache():
 
 def save_expiry_cache(cache):
     """儲存兌換期間至快取。"""
-    lines = [f"{url}\t{date}" for url, date in sorted(cache.items())]
+    lines = []
+    for url in sorted(cache.keys()):
+        expiry, status = cache[url]
+        if status:
+            lines.append(f"{url}\t{expiry}\t{status}")
+        else:
+            lines.append(f"{url}\t{expiry}")
     EXPIRY_CACHE.write_text("\n".join(lines), encoding="utf-8")
 
 
-def enrich_prizes_with_expiry(entries, verbose=True):
-    """為每個獎品補充兌換期間至，使用快取避免重複請求。"""
-    cache = load_expiry_cache()
+def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False):
+    """為每個獎品補充兌換期間至、是否已使用，使用快取避免重複請求。"""
+    cache = load_expiry_cache() if not force_refresh else {}
     updated = False
     for rec in entries:
         for p in rec["prizes"]:
             url = p["link"].strip()
-            if url in cache:
-                p["expiry"] = cache[url]
+            if url in cache and not force_refresh:
+                expiry, status = cache[url]
+                p["expiry"] = expiry
+                p["used"] = status
             else:
-                expiry = fetch_expiry_date(url)
+                expiry, used = fetch_voucher_info(url)
                 p["expiry"] = expiry if expiry else ""
-                if expiry:
-                    cache[url] = expiry
-                    updated = True
+                p["used"] = used
+                cache[url] = (p["expiry"], p["used"])
+                updated = True
                 if verbose and "txp.rs" in url:
-                    print(f"  取得兌換期間: {p['title'][:20]}... -> {p['expiry']}")
+                    print(f"  取得: {p['title'][:20]}... -> {p['expiry']} {p['used']}")
                 time.sleep(0.5)  # 避免請求過快
     if updated:
         save_expiry_cache(cache)
@@ -156,17 +172,20 @@ def build_html(entries):
     rows = []
     for i, p in enumerate(flat, 1):
         send_date = p.get("send_date", "")
+        used = p.get("used", "") or ""
+        row_class = ' class="used-row"' if used else ""
+        link_td = '<span class="used-badge">已兌換</span>' if used else f'<a href="{p["link"]}" target="_blank" rel="noopener">開啟</a>'
         if has_any_expiry:
             rows.append(
-                f"<tr><td>{i}</td><td>{p['title']}</td><td>{p.get('expiry') or ''}</td>"
+                f"<tr{row_class}><td>{i}</td><td>{p['title']}</td><td>{p.get('expiry') or ''}</td>"
                 f"<td>{send_date}</td><td>{p['time']}</td><td>Profile {p['profile']}</td>"
-                f'<td><a href="{p["link"]}" target="_blank" rel="noopener">開啟</a></td></tr>'
+                f"<td>{link_td}</td></tr>"
             )
         else:
             rows.append(
-                f"<tr><td>{i}</td><td>{p['title']}</td>"
+                f"<tr{row_class}><td>{i}</td><td>{p['title']}</td>"
                 f"<td>{send_date}</td><td>{p['time']}</td><td>Profile {p['profile']}</td>"
-                f'<td><a href="{p["link"]}" target="_blank" rel="noopener">開啟</a></td></tr>'
+                f"<td>{link_td}</td></tr>"
             )
 
     html = f"""<!DOCTYPE html>
@@ -185,6 +204,8 @@ def build_html(entries):
         th, td {{ border: 1px solid #0f3460; padding: 10px; text-align: left; }}
         th {{ background: #0f3460; color: #00d9ff; }}
         tr:nth-child(even) {{ background: #1a1a2e; }}
+        .used-row {{ opacity: 0.6; background: #1a2a1a !important; }}
+        .used-badge {{ color: #888; }}
         a {{ color: #00d9ff; }}
     </style>
 </head>
@@ -226,7 +247,7 @@ def _sort_and_group_prizes(flat):
 
 
 def build_allmysteven_html(entries):
-    """產生電子券清單 allmysteven.html（品項、兌換期間至、使用連結）。"""
+    """產生電子券清單 allmysteven.html（未兌換在上、已兌換區塊在最下）。"""
     flat = []
     seen_urls = set()
     for rec in entries:
@@ -235,49 +256,76 @@ def build_allmysteven_html(entries):
                 continue
             seen_urls.add(p["link"])
             flat.append(p)
-    flat = _sort_and_group_prizes(flat)
+    # 分為未兌換、已兌換
+    available = [p for p in flat if not p.get("used")]
+    used_list = [p for p in flat if p.get("used")]
+    available = _sort_and_group_prizes(available)
+    used_list = _sort_and_group_prizes(used_list)
     has_any_expiry = any(p.get("expiry") for p in flat)
-    rows = []
-    for i, p in enumerate(flat, 1):
-        expiry = p.get("expiry") or ""
-        if has_any_expiry:
-            rows.append(
-                f'<tr><td>{i}</td><td>{p["title"]}</td><td>{expiry}</td>'
-                f'<td><a href="{p["link"]}" target="_blank" rel="noopener" class="btn">使用</a></td></tr>'
-            )
-        else:
-            rows.append(
-                f'<tr><td>{i}</td><td>{p["title"]}</td>'
-                f'<td><a href="{p["link"]}" target="_blank" rel="noopener" class="btn">使用</a></td></tr>'
-            )
     th_expiry = '<th>兌換期間至</th>' if has_any_expiry else ''
     thead = f'<tr><th>#</th><th>品項名稱</th>{th_expiry}<th>操作</th></tr>'
+    # 未兌換區塊
+    rows_available = []
+    for i, p in enumerate(available, 1):
+        expiry = p.get("expiry") or ""
+        btn = f'<a href="{p["link"]}" target="_blank" rel="noopener" class="btn">使用</a>'
+        if has_any_expiry:
+            rows_available.append(f'<tr><td>{i}</td><td>{p["title"]}</td><td>{expiry}</td><td>{btn}</td></tr>')
+        else:
+            rows_available.append(f'<tr><td>{i}</td><td>{p["title"]}</td><td>{btn}</td></tr>')
+    # 已兌換區塊（最下面）
+    rows_used = []
+    for i, p in enumerate(used_list, 1):
+        expiry = p.get("expiry") or ""
+        link_td = f'<a href="{p["link"]}" target="_blank" rel="noopener" class="link-used">查看</a>'
+        if has_any_expiry:
+            rows_used.append(f'<tr class="used-row"><td>{i}</td><td>{p["title"]}</td><td>{expiry}</td><td>{link_td}</td></tr>')
+        else:
+            rows_used.append(f'<tr class="used-row"><td>{i}</td><td>{p["title"]}</td><td>{link_td}</td></tr>')
+    section_available = f"""
+    <h2>可兌換（{len(available)} 張）</h2>
+    <table>
+        <thead>{thead}</thead>
+        <tbody>{''.join(rows_available)}</tbody>
+    </table>
+    """ if available else ""
+    section_used = f"""
+    <h2 class="section-used">已兌換（{len(used_list)} 張）</h2>
+    <div class="used-block">
+        <table>
+            <thead>{thead}</thead>
+            <tbody>{''.join(rows_used)}</tbody>
+        </table>
+    </div>
+    """ if used_list else ""
     html = f"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>我的電子券清單</title>
+    <title>我的電子商品券</title>
     <style>
         body {{ font-family: "Microsoft JhengHei", sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; background: #1a1a2e; color: #eee; }}
         h1 {{ color: #00d9ff; }}
+        h2 {{ color: #00d9ff; font-size: 1.1em; margin-top: 24px; margin-bottom: 12px; }}
+        h2.section-used {{ color: #888; }}
+        .used-block {{ opacity: 0.85; margin-top: 8px; }}
         a {{ color: #00d9ff; }}
+        .link-used {{ color: #888; font-size: 0.9em; }}
         .summary {{ color: #888; margin-bottom: 20px; }}
-        table {{ width: 100%; border-collapse: collapse; }}
+        table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
         th, td {{ border: 1px solid #0f3460; padding: 12px; text-align: left; }}
         th {{ background: #0f3460; color: #00d9ff; }}
         .btn {{ display: inline-block; padding: 6px 16px; background: #007bff; color: white !important; text-decoration: none; border-radius: 6px; }}
         .btn:hover {{ background: #0056b3; }}
+        .used-row {{ background: #1a2a1a !important; }}
     </style>
 </head>
 <body>
     <h1>🎟️ 我的電子商品券</h1>
-    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-    <table>
-        <thead>{thead}</thead>
-        <tbody>{''.join(rows)}</tbody>
-    </table>
-    <p class="summary">目前共有商品券：{len(flat)} 張</p>
+    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}｜可兌換 {len(available)} 張、已兌換 {len(used_list)} 張</p>
+    {section_available}
+    {section_used}
 </body>
 </html>
 """
@@ -300,7 +348,7 @@ def build_txt_url_list(entries):
 def git_upload():
     """執行 git add、commit、push。"""
     try:
-        subprocess.run(["git", "add", "Telegram獎品網址整理.html", "Telegram獎品網址清單.txt", "allmysteven.html", "index.html"], 
+        subprocess.run(["git", "add", "."],  # 上傳所有檔案（含 TXT、HTML、快取等） 
                        cwd=BASE_DIR, check=True, capture_output=True, text=True)
         subprocess.run(["git", "commit", "-m", f"更新 Telegram 獎品網址整理 {datetime.now().strftime('%Y-%m-%d %H:%M')}"], 
                        cwd=BASE_DIR, check=True, capture_output=True, text=True)
@@ -333,10 +381,16 @@ def main():
         cache = load_expiry_cache()
         for rec in entries:
             for p in rec["prizes"]:
-                p["expiry"] = cache.get(p["link"].strip(), "")
+                expiry, status = cache.get(p["link"].strip(), ("", ""))
+                p["expiry"] = expiry
+                p["used"] = status
     else:
-        print("正在爬取兌換期間至（首次較慢，之後會用快取）...")
-        entries = enrich_prizes_with_expiry(entries, verbose=False)
+        force_refresh = "--refresh" in sys.argv
+        if force_refresh:
+            print("正在重新爬取所有兌換券（含已使用狀態）...")
+        else:
+            print("正在爬取兌換期間至（首次較慢，之後會用快取）...")
+        entries = enrich_prizes_with_expiry(entries, verbose=False, force_refresh=force_refresh)
 
     html = build_html(entries)
     OUTPUT_HTML.write_text(html, encoding="utf-8")
