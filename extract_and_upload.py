@@ -18,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TXT_PATTERN = str(BASE_DIR / "Yahoo序號連結查詢結果_*.txt")
 OUTPUT_HTML = BASE_DIR / "Telegram獎品網址整理.html"
 OUTPUT_TXT = BASE_DIR / "Telegram獎品網址清單.txt"
+OUTPUT_COUPON = BASE_DIR / "allmysteven.html"  # 電子券清單（與 Telegram 獎品同步）
 
 
 def parse_telegram_section(content):
@@ -139,6 +140,54 @@ def build_html(entries):
     return html
 
 
+def build_allmysteven_html(entries):
+    """產生電子券清單 allmysteven.html（品項、發送日期、使用連結）。"""
+    rows = []
+    total_count = 0
+    seen_urls = set()
+    for rec in entries:
+        send_date = rec["send_date"]
+        for p in rec["prizes"]:
+            if p["link"] in seen_urls:
+                continue
+            seen_urls.add(p["link"])
+            total_count += 1
+            rows.append(
+                f'<tr><td>{total_count}</td><td>{p["title"]}</td><td>{send_date}</td>'
+                f'<td><a href="{p["link"]}" target="_blank" rel="noopener" class="btn">使用</a></td></tr>'
+            )
+    html = f"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>我的電子券清單</title>
+    <style>
+        body {{ font-family: "Microsoft JhengHei", sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; background: #1a1a2e; color: #eee; }}
+        h1 {{ color: #00d9ff; }}
+        a {{ color: #00d9ff; }}
+        .summary {{ color: #888; margin-bottom: 20px; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ border: 1px solid #0f3460; padding: 12px; text-align: left; }}
+        th {{ background: #0f3460; color: #00d9ff; }}
+        .btn {{ display: inline-block; padding: 6px 16px; background: #007bff; color: white !important; text-decoration: none; border-radius: 6px; }}
+        .btn:hover {{ background: #0056b3; }}
+    </style>
+</head>
+<body>
+    <h1>🎟️ 我的電子商品券</h1>
+    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+    <table>
+        <thead><tr><th>#</th><th>品項名稱</th><th>發送日期</th><th>操作</th></tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+    </table>
+    <p class="summary">目前共有商品券：{total_count} 張</p>
+</body>
+</html>
+"""
+    return html
+
+
 def build_txt_url_list(entries):
     """產生純網址清單（每行一個 URL）。"""
     seen = set()
@@ -155,7 +204,7 @@ def build_txt_url_list(entries):
 def git_upload():
     """執行 git add、commit、push。"""
     try:
-        subprocess.run(["git", "add", "Telegram獎品網址整理.html", "Telegram獎品網址清單.txt"], 
+        subprocess.run(["git", "add", "Telegram獎品網址整理.html", "Telegram獎品網址清單.txt", "allmysteven.html", "index.html"], 
                        cwd=BASE_DIR, check=True, capture_output=True, text=True)
         subprocess.run(["git", "commit", "-m", f"更新 Telegram 獎品網址整理 {datetime.now().strftime('%Y-%m-%d %H:%M')}"], 
                        cwd=BASE_DIR, check=True, capture_output=True, text=True)
@@ -185,6 +234,10 @@ def main():
     html = build_html(entries)
     OUTPUT_HTML.write_text(html, encoding="utf-8")
     print(f"HTML 已寫入: {OUTPUT_HTML}")
+
+    coupon_html = build_allmysteven_html(entries)
+    OUTPUT_COUPON.write_text(coupon_html, encoding="utf-8")
+    print(f"電子券清單已寫入: {OUTPUT_COUPON}")
 
     txt_content = build_txt_url_list(entries)
     OUTPUT_TXT.write_text(txt_content, encoding="utf-8")
