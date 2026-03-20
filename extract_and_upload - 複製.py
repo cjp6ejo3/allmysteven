@@ -16,7 +16,6 @@ from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
 # 腳本所在目錄 = github 資料夾
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,7 +24,6 @@ OUTPUT_HTML = BASE_DIR / "Telegram獎品網址整理.html"
 OUTPUT_TXT = BASE_DIR / "Telegram獎品網址清單.txt"
 OUTPUT_COUPON = BASE_DIR / "allmysteven.html"  # 電子券清單（與 Telegram 獎品同步）
 EXPIRY_CACHE = BASE_DIR / "expiry_cache.txt"   # 兌換期間至快取（url -> 日期）
-MAX_THREADS = 50  # 多執行緒檢查數量
 
 
 def fetch_voucher_info(url):
@@ -36,25 +34,13 @@ def fetch_voucher_info(url):
         req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
         with urlopen(req, timeout=15) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
-        
         expiry = None
-        # 爬取日期格式: 2026.05.23 或 2026/05/23
-        m = re.search(r"([\d]{4}[\./][\d]{2}[\./][\d]{2})", html)
+        m = re.search(r"兌換期間至[\s\S]*?([\d]{4}\.[\d]{2}\.[\d]{2})", html)
         if m:
-            expiry = m.group(1).strip().replace("/", ".")
-            
-        # 檢測「已兌換/已使用」狀態的精準標記 (排除注意事項中的文字)
-        used_markers = [
-            "usededn",           # Edenred CSS marker
-            "StatusOverlayBg",   # Edenred Status overlay
-            "stamp_used.png",    # 'Used' stamp image
-            "StampStatus",       # Stamp status element
-            'class="stamp used"', # Specific CSS class
-            'id="balance">剩餘：0' # Balance is zero (specifically in the balance element)
-        ]
-        is_used = any(x in html for x in used_markers)
-        
-        used = "已兌換" if is_used else ""
+            expiry = m.group(1).strip()
+        # 判斷已使用：Edenred 用 CSS class「stamp usededn」或「StatusOverlayBg」顯示已使用圖章
+        # （「已使用」是圖示，不在 HTML 文字中）
+        used = "已兌換" if ("usededn" in html or "StatusOverlayBg" in html) else ""
         return expiry, used
     except (URLError, HTTPError, Exception):
         pass
@@ -91,47 +77,25 @@ def save_expiry_cache(cache):
 
 
 def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False):
-    """為每個獎品補充兌換期間至、是否已使用，使用多執行緒加速。"""
+    """為每個獎品補充兌換期間至、是否已使用，使用快取避免重複請求。"""
     cache = load_expiry_cache() if not force_refresh else {}
-    
-    # 收集所有需要檢查的 prize 物件
-    to_check = []
+    updated = False
     for rec in entries:
         for p in rec["prizes"]:
             url = p["link"].strip()
-            if "txp.rs" not in url:
-                continue
             if url in cache and not force_refresh:
                 expiry, status = cache[url]
                 p["expiry"] = expiry
                 p["used"] = status
             else:
-                to_check.append(p)
-
-    if not to_check:
-        return entries
-
-    print(f"  -> 共有 {len(to_check)} 筆需要連網檢查狀態 (使用 {MAX_THREADS} 執行緒)...")
-    
-    updated = False
-    
-    def process_p(p):
-        url = p["link"].strip()
-        expiry, used = fetch_voucher_info(url)
-        p["expiry"] = expiry if expiry else ""
-        p["used"] = used
-        if verbose:
-            tag = f"[{used}]" if used else "[可兌換]"
-            print(f"  取得: {p['title'][:15]}... -> {tag}")
-        return url, (p["expiry"], p["used"])
-
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        results = list(executor.map(process_p, to_check))
-    
-    for url, result_val in results:
-        cache[url] = result_val
-        updated = True
-
+                expiry, used = fetch_voucher_info(url)
+                p["expiry"] = expiry if expiry else ""
+                p["used"] = used
+                cache[url] = (p["expiry"], p["used"])
+                updated = True
+                if verbose and "txp.rs" in url:
+                    print(f"  取得: {p['title'][:20]}... -> {p['expiry']} {p['used']}")
+                time.sleep(0.5)  # 避免請求過快
     if updated:
         save_expiry_cache(cache)
     return entries
@@ -425,9 +389,8 @@ def main():
         if force_refresh:
             print("正在重新爬取所有兌換券（含已使用狀態）...")
         else:
-            print("正在爬取兌換期間至（使用多執行緒加速，之後會用快取）...")
-        # 傳入 verbose=True 以便看到進度
-        entries = enrich_prizes_with_expiry(entries, verbose=True, force_refresh=force_refresh)
+            print("正在爬取兌換期間至（首次較慢，之後會用快取）...")
+        entries = enrich_prizes_with_expiry(entries, verbose=False, force_refresh=force_refresh)
 
     html = build_html(entries)
     OUTPUT_HTML.write_text(html, encoding="utf-8")
