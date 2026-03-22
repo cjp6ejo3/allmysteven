@@ -309,8 +309,32 @@ def main():
     df.insert(0, "#", range(1, len(df) + 1))
 
     # 建立統計數量的 DataFrame
-    stats_df = df[df["使用狀態"] != "已兌換"].copy()
-    stats_df = stats_df.groupby(["標題", "兌換期間至"], sort=False).size().reset_index(name="數量")
+    # 統計規則：模仿 Excel COUNTA 邏輯。只要「備註」有內容（長度 > 0）或已兌換，就不計數。
+    print("正在執行精確過濾（扣除已備註項目）...")
+    
+    def get_countable_value(row):
+        # 取得備註，清洗掉 NaN、前後空白與隱形字元
+        rem = str(row.get("備註", "")).strip().replace("nan", "")
+        # 取得使用狀態
+        stat = str(row.get("使用狀態", "")).strip().replace("nan", "")
+        
+        # 如果「備註」有任何內容（COUNTA 為 1），這筆算 0 (不計入數量)
+        if len(rem) > 0:
+            return 0
+        # 如果狀態已經標記為「已兌換」，算 0 (不計入數量)
+        if stat == "已兌換":
+            return 0
+        # 只有真正全空的才算 1
+        return 1
+
+    # 建立一個臨時的計數欄位
+    df["_tmp_count"] = df.apply(get_countable_value, axis=1)
+    
+    # 依照標題與到期日分組，並將剛才生成的計數欄位加總
+    stats_df = df.groupby(["標題", "兌換期間至"], sort=False)["_tmp_count"].sum().reset_index(name="數量")
+    
+    # 移除輔助欄位
+    df.drop(columns=["_tmp_count"], inplace=True)
     
     # 匯出到 Excel 的函式
     def save_to_path(path):
