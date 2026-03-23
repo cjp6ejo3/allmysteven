@@ -399,7 +399,8 @@ def git_upload():
 
 
 def main():
-    do_upload = "--upload" in sys.argv or "-u" in sys.argv
+    # 預設為執行後自動上傳 GitHub，可以直接從 IDE 點擊執行 (PY) 
+    do_upload = True
 
     print("正在掃描 github 資料夾內的 Yahoo 序號查詢結果...")
     entries = collect_all_prizes()
