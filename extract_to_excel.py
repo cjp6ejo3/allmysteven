@@ -10,6 +10,7 @@ import re
 import sys
 import glob
 import time
+import unicodedata
 from pathlib import Path
 from datetime import datetime
 from urllib.request import urlopen, Request
@@ -28,6 +29,67 @@ TIMESTAMP = datetime.now().strftime('%Y%m%d%H%M')
 OUTPUT_EXCEL = BASE_DIR / f"{FILENAME_BASE}_{TIMESTAMP}.xlsx"
 EXPIRY_CACHE = BASE_DIR / "expiry_cache.txt"   # 兌換期間至快取（url -> 日期）
 MAX_THREADS = 30  # 多執行緒檢查數量
+
+# ── 獎項標題 → 價錢對照（「統計數量」分頁用）
+# 比對時會做 NFKC 正規化並去掉空白／零寬字元。
+# 優先「正規化後完全相等」；若無，則「字典 key 與實際標題任一方包含另一方」即視為同品項
+# （例如實際標題較長、字典只寫簡稱）。多筆同時符合時取「key 字數最長」者，較不易誤配。
+# 未列出的品項價錢留白。
+PRICE_LOOKUP = {
+    "摩斯漢堡蛋堡套餐（早餐限定）": 30,
+    "85度C58元切片蛋糕": 30,
+    "85°C58元切片蛋糕": 30,
+    "摩斯漢堡超級大麥海洋珍珠堡套餐": 70,
+    "肯德基咔啦脆雞脆薯套餐": 40,
+    "必勝客夏威夷6吋個人比薩": 40,
+    "台酒花雕雞/花雕酸菜牛肉": 30,
+    "CoCo都可珍珠鮮奶茶": 30,
+    "麥當勞OREO冰炫風": 30,
+    "麥當勞勁辣鷄腿堡套餐": 52,
+    # 簡體「劲」或來源異寫時仍可對到
+    "麥當勞劲辣雞腿堡套餐": 52,
+    "Mister Donut經典午茶組": 35,
+}
+
+
+def _norm_title_key(title):
+    """與 PRICE_LOOKUP 比對用的正規化標題（去空白、NFKC）。"""
+    if title is None or (isinstance(title, float) and pd.isna(title)):
+        return ""
+    t = unicodedata.normalize("NFKC", str(title)).strip()
+    # 零寬字元、各種空白、全形空格
+    t = re.sub(r"[\s\u200b\u200c\u200d\ufeff\u3000]+", "", t)
+    # 85°C / ℃ 與「85度C」資料來源不一時，統一成「度C」再比對
+    t = t.replace("℃", "度C").replace("°C", "度C")
+    if not t or t.lower() == "nan":
+        return ""
+    return t
+
+
+# 正規化後標題 -> 價錢（多個原始 key 若正規化相同，後者覆蓋前者）
+PRICE_BY_NORM = {_norm_title_key(k): v for k, v in PRICE_LOOKUP.items()}
+
+
+def price_for_title(title):
+    """依「標題」查價錢；對不到則回傳空白字串（Excel 顯示為空）。"""
+    t = _norm_title_key(title)
+    if not t:
+        return ""
+    # 1) 正規化後完全相等
+    v = PRICE_BY_NORM.get(t)
+    if v is not None:
+        return v
+    # 2) 包含比對：字典 key 出現在標題裡，或標題出現在 key 裡（擇最長 key 以免誤配）
+    best_key = None
+    best_price = None
+    for nk, price in PRICE_BY_NORM.items():
+        if not nk:
+            continue
+        if nk in t or t in nk:
+            if best_key is None or len(nk) > len(best_key):
+                best_key = nk
+                best_price = price
+    return best_price if best_price is not None else ""
 
 
 def fetch_voucher_info(url):
@@ -340,6 +402,11 @@ def main():
     
     # 依照標題與到期日分組，並將剛才生成的計數欄位加總
     stats_df = df.groupby(["標題", "兌換期間至"], sort=False)["_tmp_count"].sum().reset_index(name="數量")
+    stats_df["價錢"] = stats_df["標題"].map(price_for_title)
+    # 「總計」欄請在 Excel 手填倍數（例如 1、2）；金額合計 = Σ(價錢 × 總計)，由表尾公式計算。
+    stats_df["總計"] = ""
+    # 欄位順序：標題、兌換期間至、數量 → 價錢 → 總計
+    stats_df = stats_df[["標題", "兌換期間至", "數量", "價錢", "總計"]]
     
     # 移除輔助欄位
     df.drop(columns=["_tmp_count"], inplace=True)
@@ -353,7 +420,9 @@ def main():
 
             # 2. 導出一個「統計數量」分頁 (統計清單)
             stats_df.to_excel(writer, index=False, sheet_name='統計數量')
-            _format_sheet(writer.sheets['統計數量'], stats_df)
+            stats_ws = writer.sheets['統計數量']
+            _format_sheet(stats_ws, stats_df)
+            _add_stats_grand_total_row(stats_ws, n_data_rows=len(stats_df))
 
             # 3. 依照「標題」拆分分頁
             for title, group in df.groupby("標題", sort=False):
@@ -374,6 +443,32 @@ def main():
         print(f"❌ 寫入 Excel 失敗: {e}")
 
     print(f"完成。最終彙整出 {len(df)} 筆不重複獎項。")
+
+
+def _add_stats_grand_total_row(worksheet, n_data_rows):
+    """
+    「統計數量」表尾：E 欄寫入 SUMPRODUCT(價錢欄 D, 手填倍數欄 E)，即 Σ(價錢×總計)。
+    n_data_rows：資料列筆數（不含第 1 列表頭）。
+    """
+    from openpyxl.styles import Border, Side, Alignment
+
+    if n_data_rows <= 0:
+        return
+
+    thin = Side(border_style="thin", color="000000")
+    border = Border(top=thin, left=thin, right=thin, bottom=thin)
+    last_data_row = 1 + n_data_rows
+    sum_row = last_data_row + 1
+
+    c_a = worksheet.cell(row=sum_row, column=1, value="金額合計")
+    c_a.border = border
+    c_a.alignment = Alignment(vertical="center")
+
+    formula = f"=SUMPRODUCT(D2:D{last_data_row},E2:E{last_data_row})"
+    c_e = worksheet.cell(row=sum_row, column=5, value=formula)
+    c_e.border = border
+    c_e.alignment = Alignment(vertical="center")
+    c_e.number_format = "0"
 
 
 def _format_sheet(worksheet, df):

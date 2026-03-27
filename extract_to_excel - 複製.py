@@ -306,6 +306,14 @@ def main():
     
     cols = ["備註", "標題", "兌換期間至", "連結", "使用狀態", "發送日期", "時間", "Profile"]
     df = df[cols]
+    # 「總彙整」排序規則：
+    # 1) 備註為空白放最上面
+    # 2) 備註非空白集中排到最下面
+    # 3) 各自維持原本先後順序（穩定分組，不做內容重排）
+    _remark_clean = df["備註"].fillna("").astype(str).str.strip()
+    _blank_mask = _remark_clean.eq("") | _remark_clean.eq("nan")
+    df = pd.concat([df[_blank_mask], df[~_blank_mask]], ignore_index=True)
+
     df.insert(0, "#", range(1, len(df) + 1))
 
     # 建立統計數量的 DataFrame
