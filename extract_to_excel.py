@@ -3,6 +3,9 @@
 從 github 資料夾內所有 Yahoo 序號查詢結果中，
 提取「📱 發送到 Telegram 的獎品 📱」區塊的獎項與網址，
 彙整成一個 Excel 檔案。
+
+txp.rs 是否重新連網檢查「已兌換」：見檔案置頂 FORCE_REFRESH_VOUCHER_STATUS；
+亦可執行時加參數 --refresh。
 """
 
 import os
@@ -27,8 +30,15 @@ FILENAME_BASE = "Yahoo獎項網址彙整"
 MAIN_EXCEL = BASE_DIR / f"{FILENAME_BASE}.xlsx"
 TIMESTAMP = datetime.now().strftime('%Y%m%d%H%M')
 OUTPUT_EXCEL = BASE_DIR / f"{FILENAME_BASE}_{TIMESTAMP}.xlsx"
-EXPIRY_CACHE = BASE_DIR / "expiry_cache.txt"   # 兌換期間至快取（url -> 日期）
+EXPIRY_CACHE = BASE_DIR / "expiry_cache.txt"   # 兌換期間至／使用狀態快取（url -> 資料）
 MAX_THREADS = 30  # 多執行緒檢查數量
+
+# ── txp.rs 連網檢查：兌換期間至 + 是否已兌換 ──
+# False（預設）：使用 expiry_cache.txt 快取。已快取過的網址不重複連網（省時間）；
+#               若曾寫入「未標示已兌換」，之後也不會自動更新，除非改 True 或刪快取列。
+# True：略過快取，每筆 txp.rs 都重新下載 HTML 再判斷「已兌換」與到期日（較慢、狀態較新）。
+# 命令列加 --refresh 時，本次執行強制等同 True（可蓋過上面常數，不必改檔）。False 是快取
+FORCE_REFRESH_VOUCHER_STATUS = False
 
 # ── 獎項標題 → 價錢對照（「統計數量」分頁用）
 # 比對時會做 NFKC 正規化並去掉空白／零寬字元。
@@ -288,11 +298,19 @@ def main():
     total_count = sum(len(e["prizes"]) for e in entries)
     print(f"共找到 {len(entries)} 個日期的 Telegram 獎項區塊，累計 {total_count} 筆獎項。")
     
-    force_refresh = "--refresh" in sys.argv
+    force_refresh = FORCE_REFRESH_VOUCHER_STATUS or ("--refresh" in sys.argv)
     if force_refresh:
-        print("正在重新爬取所有兌換券（含已使用狀態）...")
+        reasons = []
+        if FORCE_REFRESH_VOUCHER_STATUS:
+            reasons.append("FORCE_REFRESH_VOUCHER_STATUS=True（置頂）")
+        if "--refresh" in sys.argv:
+            reasons.append("命令列 --refresh")
+        print(f"正在重新爬取所有兌換券（含是否已兌換）〔{'；'.join(reasons)}〕...")
     else:
-        print("正在爬取兌換期間至（使用快取節省時間）...")
+        print(
+            "正在爬取兌換期間至與使用狀態（使用 expiry_cache.txt 快取；"
+            "置頂改 FORCE_REFRESH_VOUCHER_STATUS=True 或加 --refresh 可強制重抓）..."
+        )
     
     # 攤平所有獎項以便檢查與處理
     prizes_list = []
