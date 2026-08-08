@@ -1011,3 +1011,7 @@ https://txp.rs/viewvoucher.aspx?voucherguid=f711cece-3995-4c9b-b4a2-70993713e5b2
 https://txp.rs/viewvoucher.aspx?voucherguid=ec31d010-d6fa-447d-84d5-71db46852d87
 https://txp.rs/viewvoucher.aspx?voucherguid=c885bc3b-c9fd-4492-8079-7eb5a75225a8
 https://txp.rs/viewvoucher.aspx?voucherguid=b7b2714e-8282-42ab-8f71-9bb54532410c
+https://txp.rs/viewvoucher.aspx?voucherguid=1e6779a3-26cf-4e85-9372-b1d0d7eb390e
+https://txp.rs/viewvoucher.aspx?voucherguid=0f0f449c-0ce9-4486-8465-e14d8dba1e3e
+https://txp.rs/viewvoucher.aspx?voucherguid=feac8f60-abb2-4d6a-885d-943f9d3e7389
+https://txp.rs/viewvoucher.aspx?voucherguid=4c16a7a1-6d9a-46a0-8149-baf421842fcf

@@ -12,7 +12,7 @@ import glob
 import subprocess
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from collections import defaultdict
@@ -26,6 +26,8 @@ OUTPUT_TXT = BASE_DIR / "Telegram獎品網址清單.txt"
 OUTPUT_COUPON = BASE_DIR / "allmysteven.html"  # 電子券清單（與 Telegram 獎品同步）
 EXPIRY_CACHE = BASE_DIR / "expiry_cache.txt"   # 兌換期間至快取（url -> 日期）
 MAX_THREADS = 50  # 多執行緒檢查數量
+DEFAULT_RECENT_DAYS = 10  # 每日更新：只重查近 N 天的券狀態
+FILE_DATE_RE = re.compile(r"Yahoo序號連結查詢結果_(\d{8})\.txt$", re.IGNORECASE)
 
 
 def fetch_voucher_info(url):
@@ -90,18 +92,33 @@ def save_expiry_cache(cache):
     EXPIRY_CACHE.write_text("\n".join(lines), encoding="utf-8")
 
 
-def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False):
-    """為每個獎品補充兌換期間至、是否已使用，使用多執行緒加速。"""
-    cache = load_expiry_cache() if not force_refresh else {}
-    
-    # 收集所有需要檢查的 prize 物件
+def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False, refresh_urls=None):
+    """為每個獎品補充兌換期間至、是否已使用。
+
+    - 新網址（不在快取）：一律連網檢查
+    - force_refresh=False：已在快取的沿用，不重抓
+    - force_refresh=True 且 refresh_urls 有值：只重抓該集合內的網址
+    - force_refresh=True 且 refresh_urls is None：重抓全部（舊行為，慎用）
+    """
+    cache = load_expiry_cache()
+    refresh_set = set(refresh_urls) if refresh_urls is not None else None
+
     to_check = []
     for rec in entries:
         for p in rec["prizes"]:
             url = p["link"].strip()
             if "txp.rs" not in url:
                 continue
-            if url in cache and not force_refresh:
+            in_cache = url in cache
+            must_refresh = False
+            if force_refresh:
+                if refresh_set is None or url in refresh_set:
+                    # 已兌換的不必每天重抓
+                    if in_cache and cache[url][1] == "已兌換":
+                        must_refresh = False
+                    else:
+                        must_refresh = True
+            if in_cache and not must_refresh:
                 expiry, status = cache[url]
                 p["expiry"] = expiry
                 p["used"] = status
@@ -109,12 +126,13 @@ def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False):
                 to_check.append(p)
 
     if not to_check:
+        print("  -> 無新網址／無需重查，沿用快取。")
         return entries
 
     print(f"  -> 共有 {len(to_check)} 筆需要連網檢查狀態 (使用 {MAX_THREADS} 執行緒)...")
-    
+
     updated = False
-    
+
     def process_p(p):
         url = p["link"].strip()
         expiry, used = fetch_voucher_info(url)
@@ -127,7 +145,7 @@ def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False):
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         results = list(executor.map(process_p, to_check))
-    
+
     for url, result_val in results:
         cache[url] = result_val
         updated = True
@@ -170,9 +188,37 @@ def parse_telegram_section(content):
     return send_date, prizes
 
 
-def collect_all_prizes():
-    """掃描 github 資料夾內所有 txt，收集 Telegram 區塊的獎項。"""
+def file_date_from_name(fname):
+    """從 Yahoo序號連結查詢結果_YYYYMMDD.txt 取出日期；無法解析則 None。"""
+    m = FILE_DATE_RE.search(os.path.basename(fname))
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def list_result_files(days=None):
+    """列出結果 txt；days 設為 N 時只留含今天起算最近 N 天。"""
     files = sorted(glob.glob(TXT_PATTERN))
+    if not days or days <= 0:
+        return files
+    cutoff = datetime.now().date() - timedelta(days=days - 1)
+    out = []
+    for fpath in files:
+        d = file_date_from_name(fpath)
+        if d is not None and d >= cutoff:
+            out.append(fpath)
+    return out
+
+
+def collect_all_prizes(days=None):
+    """掃描 github 資料夾內 txt，收集 Telegram 區塊的獎項。
+
+    days=None：全部檔案；days=N：只掃最近 N 天的結果檔。
+    """
+    files = list_result_files(days=days)
     all_entries = []
 
     for fpath in files:
@@ -186,9 +232,40 @@ def collect_all_prizes():
         send_date, prizes = parse_telegram_section(content)
         if send_date is None:
             continue
-        all_entries.append({"file": fname, "send_date": send_date, "prizes": prizes})
+        all_entries.append({
+            "file": fname,
+            "send_date": send_date,
+            "prizes": prizes,
+            "file_date": file_date_from_name(fname),
+        })
 
     return all_entries
+
+
+def collect_urls_from_entries(entries):
+    """收集 entries 內所有 txp.rs 網址。"""
+    urls = set()
+    for rec in entries:
+        for p in rec.get("prizes") or []:
+            url = (p.get("link") or "").strip()
+            if "txp.rs" in url:
+                urls.add(url)
+    return urls
+
+
+def parse_cli_days(argv):
+    """解析 --days N；有 --days 無數字則用 DEFAULT_RECENT_DAYS；沒有 --days 回傳 None。"""
+    for i, arg in enumerate(argv):
+        if arg == "--days":
+            if i + 1 < len(argv) and str(argv[i + 1]).isdigit():
+                return int(argv[i + 1])
+            return DEFAULT_RECENT_DAYS
+        if arg.startswith("--days="):
+            part = arg.split("=", 1)[1].strip()
+            if part.isdigit():
+                return int(part)
+            return DEFAULT_RECENT_DAYS
+    return None
 
 
 def build_html(entries):
@@ -381,14 +458,28 @@ def build_txt_url_list(entries):
     return "\n".join(lines)
 
 
+def git_has_changes():
+    """工作區是否有未提交變更。"""
+    r = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=BASE_DIR, capture_output=True, text=True,
+    )
+    return bool((r.stdout or "").strip())
+
+
 def git_upload():
-    """執行 git add、commit、push。"""
+    """有變更才 git add／commit／push；無新內容則略過。"""
     try:
-        subprocess.run(["git", "add", "."],  # 上傳所有檔案（含 TXT、HTML、快取等） 
+        subprocess.run(["git", "add", "."],
                        cwd=BASE_DIR, check=True, capture_output=True, text=True)
-        subprocess.run(["git", "commit", "-m", f"更新 Telegram 獎品網址整理 {datetime.now().strftime('%Y-%m-%d %H:%M')}"], 
-                       cwd=BASE_DIR, check=True, capture_output=True, text=True)
-        subprocess.run(["git", "push", "origin", "main"], 
+        if not git_has_changes():
+            print("沒有新內容可上傳（與上次相同），略過 commit／push。")
+            return "skip"
+        subprocess.run(
+            ["git", "commit", "-m", f"更新 Telegram 獎品網址整理 {datetime.now().strftime('%Y-%m-%d %H:%M')}"],
+            cwd=BASE_DIR, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(["git", "push", "origin", "main"],
                        cwd=BASE_DIR, check=True, capture_output=True, text=True)
         return True
     except subprocess.CalledProcessError as e:
@@ -399,11 +490,18 @@ def git_upload():
 
 
 def main():
-    # 預設為執行後自動上傳 GitHub，可以直接從 IDE 點擊執行 (PY) 
+    # 預設為執行後自動上傳 GitHub，可以直接從 IDE 點擊執行 (PY)
     do_upload = True
+    force_refresh = "--refresh" in sys.argv
+    skip_fetch = "--no-fetch" in sys.argv
+    recent_days = parse_cli_days(sys.argv)
+    # 每日慣例：有 --refresh 沒寫 --days 時，預設只重查近 10 天（避免整庫重抓）
+    if force_refresh and recent_days is None and "--all" not in sys.argv:
+        recent_days = DEFAULT_RECENT_DAYS
 
     print("正在掃描 github 資料夾內的 Yahoo 序號查詢結果...")
-    entries = collect_all_prizes()
+    # HTML／清單仍彙整全部歷史；連網重查只針對近 N 天
+    entries = collect_all_prizes(days=None)
     if not entries:
         print("未找到任何「📱 發送到 Telegram 的獎品 📱」區塊。")
         return
@@ -412,7 +510,14 @@ def main():
     total_prizes = sum(len(e["prizes"]) for e in entries)
     print(f"獎項總筆數: {total_prizes}")
 
-    skip_fetch = "--no-fetch" in sys.argv
+    refresh_urls = None
+    if recent_days:
+        recent_entries = collect_all_prizes(days=recent_days)
+        refresh_urls = collect_urls_from_entries(recent_entries)
+        print(f"近 {recent_days} 天結果檔：{len(recent_entries)} 個日期、"
+              f"{sum(len(e['prizes']) for e in recent_entries)} 筆獎項、"
+              f"{len(refresh_urls)} 個可重查網址")
+
     if skip_fetch:
         print("略過爬取兌換期間至（僅用快取）。")
         cache = load_expiry_cache()
@@ -422,14 +527,23 @@ def main():
                 p["expiry"] = expiry
                 p["used"] = status
     else:
-        force_refresh = "--refresh" in sys.argv
+        enrich_refresh_urls = None
         if force_refresh:
-            print("正在重新爬取所有兌換券（含已使用狀態）...")
+            if recent_days:
+                print(f"重新檢查近 {recent_days} 天券狀態；其餘沿用快取；新網址一律檢查...")
+                enrich_refresh_urls = refresh_urls if refresh_urls is not None else set()
+            else:
+                print("正在重新爬取所有兌換券（含已使用狀態）...")
+                enrich_refresh_urls = None  # 全量重抓
         else:
-            print("正在爬取兌換期間至（使用多執行緒加速，之後會用快取）...")
-        # 傳入 verbose=True 以便看到進度
-        entries = enrich_prizes_with_expiry(entries, verbose=True, force_refresh=force_refresh)
-
+            print("正在爬取兌換期間至（僅新網址；已快取略過）...")
+            enrich_refresh_urls = None
+        entries = enrich_prizes_with_expiry(
+            entries,
+            verbose=True,
+            force_refresh=force_refresh,
+            refresh_urls=enrich_refresh_urls,
+        )
     html = build_html(entries)
     OUTPUT_HTML.write_text(html, encoding="utf-8")
     print(f"HTML 已寫入: {OUTPUT_HTML}")
@@ -444,8 +558,11 @@ def main():
 
     if do_upload:
         print("正在上傳到 GitHub...")
-        if git_upload():
+        result = git_upload()
+        if result is True:
             print("✅ 上傳完成！")
+        elif result == "skip":
+            print("✅ 無需上傳。")
         else:
             print("❌ 上傳失敗，請手動執行 git push。")
     else:
