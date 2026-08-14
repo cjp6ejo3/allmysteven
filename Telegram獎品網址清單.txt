@@ -1025,3 +1025,5 @@ https://txp.rs/viewvoucher.aspx?voucherguid=9bc4d461-8bd6-47ed-a21e-a55b7e55fd39
 https://txp.rs/viewvoucher.aspx?voucherguid=04e94b82-3996-4983-bc15-56bab112af31
 https://txp.rs/viewvoucher.aspx?voucherguid=c518aede-9460-460d-ba2e-1e6186bec66f
 https://txp.rs/viewvoucher.aspx?voucherguid=37049d3f-90e0-451c-abfa-b786a3383e42
+https://txp.rs/viewvoucher.aspx?voucherguid=674ab024-9f77-4e57-a403-53a9e81ee761
+https://txp.rs/viewvoucher.aspx?voucherguid=56d2392a-a8fd-45f5-bd74-44a814e938e7
