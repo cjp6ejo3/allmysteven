@@ -1043,3 +1043,4 @@ https://txp.rs/viewvoucher.aspx?voucherguid=98458fb3-1eaa-4300-bcfc-8fb2a2b01be1
 https://txp.rs/viewvoucher.aspx?voucherguid=6b1553d6-4510-460f-b52a-0eea40dad9c2
 https://txp.rs/viewvoucher.aspx?voucherguid=f0cb0835-4981-4f2e-9da6-fa46a202fb68
 https://txp.rs/viewvoucher.aspx?voucherguid=7e760981-4b89-4b64-a2c7-899542702a99
+https://txp.rs/viewvoucher.aspx?voucherguid=42aa31fc-4377-43b1-baff-e345532ec442
