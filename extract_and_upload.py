@@ -28,6 +28,8 @@ EXPIRY_CACHE = BASE_DIR / "expiry_cache.txt"   # 兌換期間至快取（url -> 
 MAX_THREADS = 50  # 多執行緒檢查數量
 DEFAULT_RECENT_DAYS = 10  # 每日更新：只重查近 N 天的券狀態
 FILE_DATE_RE = re.compile(r"Yahoo序號連結查詢結果_(\d{8})\.txt$", re.IGNORECASE)
+# 上傳頁面不收錄已兌換（可兌換／開啟清單才上傳）；加 --include-used 可改回舊行為
+EXCLUDE_USED_FROM_PUBLISH = True
 
 
 def fetch_voucher_info(url):
@@ -92,6 +94,27 @@ def save_expiry_cache(cache):
     EXPIRY_CACHE.write_text("\n".join(lines), encoding="utf-8")
 
 
+def parse_expiry_date(expiry: str):
+    """解析 2026.08.28 / 2026/08/28 → date；失敗回 None。"""
+    s = (expiry or "").strip().replace("/", ".")
+    m = re.fullmatch(r"(\d{4})\.(\d{2})\.(\d{2})", s)
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+    except ValueError:
+        return None
+
+
+def is_expiry_passed(expiry: str, today=None) -> bool:
+    d = parse_expiry_date(expiry)
+    if not d:
+        return False
+    if today is None:
+        today = datetime.now().date()
+    return d < today
+
+
 def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False, refresh_urls=None):
     """為每個獎品補充兌換期間至、是否已使用。
 
@@ -99,9 +122,12 @@ def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False, refres
     - force_refresh=False：已在快取的沿用，不重抓
     - force_refresh=True 且 refresh_urls 有值：只重抓該集合內的網址
     - force_refresh=True 且 refresh_urls is None：重抓全部（舊行為，慎用）
+    - 例外：快取未標已兌換、但兌換期間已過 → 強制重查
+      （避免像萊爾富純喫茶：實際已兌換卻仍顯示開啟／未換過）
     """
     cache = load_expiry_cache()
     refresh_set = set(refresh_urls) if refresh_urls is not None else None
+    today = datetime.now().date()
 
     to_check = []
     for rec in entries:
@@ -118,6 +144,11 @@ def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False, refres
                         must_refresh = False
                     else:
                         must_refresh = True
+            # 快取以為還能用，但到期日已過 → 重查（可能其實已兌換）
+            if in_cache and not must_refresh:
+                expiry_c, status_c = cache[url]
+                if status_c != "已兌換" and is_expiry_passed(expiry_c, today):
+                    must_refresh = True
             if in_cache and not must_refresh:
                 expiry, status = cache[url]
                 p["expiry"] = expiry
@@ -268,16 +299,22 @@ def parse_cli_days(argv):
     return None
 
 
-def build_html(entries):
-    """產生整理後的 HTML 頁面（所有網址彙總）。"""
+def build_html(entries, exclude_used=None):
+    """產生整理後的 HTML 頁面（預設不收錄已兌換）。"""
+    if exclude_used is None:
+        exclude_used = EXCLUDE_USED_FROM_PUBLISH
     flat = []
     seen_urls = set()
+    skipped_used = 0
     for rec in entries:
         send_date = rec["send_date"]
         for p in rec["prizes"]:
             if p["link"] in seen_urls:
                 continue
             seen_urls.add(p["link"])
+            if exclude_used and (p.get("used") or ""):
+                skipped_used += 1
+                continue
             flat.append({**p, "send_date": send_date})
     flat = _sort_and_group_prizes(flat)
     has_any_expiry = any(p.get("expiry") for p in flat)
@@ -301,6 +338,11 @@ def build_html(entries):
                 f"<td>{link_td}</td></tr>"
             )
 
+    note = (
+        f"｜已兌換 {skipped_used} 筆不上傳"
+        if exclude_used and skipped_used
+        else ""
+    )
     html = f"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -324,7 +366,7 @@ def build_html(entries):
 </head>
 <body>
     <h1>📱 發送到 Telegram 的獎品 📱</h1>
-    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}｜共 {len(entries)} 個查詢日、{total_count} 筆獎項網址（同類型、依到期日排序）</p>
+    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}｜共 {len(entries)} 個查詢日、{total_count} 筆可兌換網址{note}（同類型、依到期日排序）</p>
     <div class="table-wrap">
         <table>
             <thead><tr><th>#</th><th>標題</th>{'<th>兌換期間至</th>' if has_any_expiry else ''}<th>發送日期</th><th>時間</th><th>Profile</th><th>連結</th></tr></thead>
@@ -359,8 +401,10 @@ def _sort_and_group_prizes(flat):
     return result
 
 
-def build_allmysteven_html(entries):
-    """產生電子券清單 allmysteven.html（未兌換在上、已兌換區塊在最下）。"""
+def build_allmysteven_html(entries, exclude_used=None):
+    """產生電子券清單 allmysteven.html（預設只上傳可兌換）。"""
+    if exclude_used is None:
+        exclude_used = EXCLUDE_USED_FROM_PUBLISH
     flat = []
     seen_urls = set()
     for rec in entries:
@@ -374,7 +418,7 @@ def build_allmysteven_html(entries):
     used_list = [p for p in flat if p.get("used")]
     available = _sort_and_group_prizes(available)
     used_list = _sort_and_group_prizes(used_list)
-    has_any_expiry = any(p.get("expiry") for p in flat)
+    has_any_expiry = any(p.get("expiry") for p in available + ([] if exclude_used else used_list))
     th_expiry = '<th>兌換期間至</th>' if has_any_expiry else ''
     thead = f'<tr><th>#</th><th>品項名稱</th>{th_expiry}<th>操作</th></tr>'
     # 未兌換區塊
@@ -386,23 +430,18 @@ def build_allmysteven_html(entries):
             rows_available.append(f'<tr><td>{i}</td><td>{p["title"]}</td><td>{expiry}</td><td>{btn}</td></tr>')
         else:
             rows_available.append(f'<tr><td>{i}</td><td>{p["title"]}</td><td>{btn}</td></tr>')
-    # 已兌換區塊（最下面）
+    # 已兌換區塊（預設不上傳）
     rows_used = []
-    for i, p in enumerate(used_list, 1):
-        expiry = p.get("expiry") or ""
-        link_td = f'<a href="{p["link"]}" target="_blank" rel="noopener" class="link-used">查看</a>'
-        if has_any_expiry:
-            rows_used.append(f'<tr class="used-row"><td>{i}</td><td>{p["title"]}</td><td>{expiry}</td><td>{link_td}</td></tr>')
-        else:
-            rows_used.append(f'<tr class="used-row"><td>{i}</td><td>{p["title"]}</td><td>{link_td}</td></tr>')
-    section_available = f"""
-    <h2>可兌換（{len(available)} 張）</h2>
-    <table>
-        <thead>{thead}</thead>
-        <tbody>{''.join(rows_available)}</tbody>
-    </table>
-    """ if available else ""
-    section_used = f"""
+    section_used = ""
+    if not exclude_used:
+        for i, p in enumerate(used_list, 1):
+            expiry = p.get("expiry") or ""
+            link_td = f'<a href="{p["link"]}" target="_blank" rel="noopener" class="link-used">查看</a>'
+            if has_any_expiry:
+                rows_used.append(f'<tr class="used-row"><td>{i}</td><td>{p["title"]}</td><td>{expiry}</td><td>{link_td}</td></tr>')
+            else:
+                rows_used.append(f'<tr class="used-row"><td>{i}</td><td>{p["title"]}</td><td>{link_td}</td></tr>')
+        section_used = f"""
     <h2 class="section-used">已兌換（{len(used_list)} 張）</h2>
     <div class="used-block">
         <table>
@@ -411,6 +450,18 @@ def build_allmysteven_html(entries):
         </table>
     </div>
     """ if used_list else ""
+    section_available = f"""
+    <h2>可兌換（{len(available)} 張）</h2>
+    <table>
+        <thead>{thead}</thead>
+        <tbody>{''.join(rows_available)}</tbody>
+    </table>
+    """ if available else ""
+    used_note = (
+        f"、已兌換 {len(used_list)} 張不上傳"
+        if exclude_used
+        else f"、已兌換 {len(used_list)} 張"
+    )
     html = f"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -436,7 +487,7 @@ def build_allmysteven_html(entries):
 </head>
 <body>
     <h1>🎟️ 我的電子商品券</h1>
-    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}｜可兌換 {len(available)} 張、已兌換 {len(used_list)} 張</p>
+    <p class="summary">最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}｜可兌換 {len(available)} 張{used_note}</p>
     {section_available}
     {section_used}
 </body>
@@ -445,12 +496,16 @@ def build_allmysteven_html(entries):
     return html
 
 
-def build_txt_url_list(entries):
-    """產生純網址清單（每行一個 URL）。"""
+def build_txt_url_list(entries, exclude_used=None):
+    """產生純網址清單（每行一個 URL；預設不含已兌換）。"""
+    if exclude_used is None:
+        exclude_used = EXCLUDE_USED_FROM_PUBLISH
     seen = set()
     lines = []
     for rec in entries:
         for p in rec["prizes"]:
+            if exclude_used and (p.get("used") or ""):
+                continue
             link = p["link"].strip()
             if link and link not in seen:
                 seen.add(link)
@@ -494,6 +549,8 @@ def main():
     do_upload = True
     force_refresh = "--refresh" in sys.argv
     skip_fetch = "--no-fetch" in sys.argv
+    include_used = "--include-used" in sys.argv
+    exclude_used = EXCLUDE_USED_FROM_PUBLISH and not include_used
     recent_days = parse_cli_days(sys.argv)
     # 每日慣例：有 --refresh 沒寫 --days 時，預設只重查近 10 天（避免整庫重抓）
     if force_refresh and recent_days is None and "--all" not in sys.argv:
@@ -509,6 +566,8 @@ def main():
     print(f"共 {len(entries)} 個日期的 Telegram 獎項區塊。")
     total_prizes = sum(len(e["prizes"]) for e in entries)
     print(f"獎項總筆數: {total_prizes}")
+    if exclude_used:
+        print("上傳模式：已兌換不上傳（僅可兌換）；若要含已兌換加 --include-used")
 
     refresh_urls = None
     if recent_days:
@@ -530,13 +589,14 @@ def main():
         enrich_refresh_urls = None
         if force_refresh:
             if recent_days:
-                print(f"重新檢查近 {recent_days} 天券狀態；其餘沿用快取；新網址一律檢查...")
+                print(f"重新檢查近 {recent_days} 天券狀態；其餘沿用快取；"
+                      f"到期未標已兌換會強制重查；新網址一律檢查...")
                 enrich_refresh_urls = refresh_urls if refresh_urls is not None else set()
             else:
                 print("正在重新爬取所有兌換券（含已使用狀態）...")
                 enrich_refresh_urls = None  # 全量重抓
         else:
-            print("正在爬取兌換期間至（僅新網址；已快取略過）...")
+            print("正在爬取兌換期間至（僅新網址；已快取略過；到期未標已兌換會重查）...")
             enrich_refresh_urls = None
         entries = enrich_prizes_with_expiry(
             entries,
@@ -544,15 +604,15 @@ def main():
             force_refresh=force_refresh,
             refresh_urls=enrich_refresh_urls,
         )
-    html = build_html(entries)
+    html = build_html(entries, exclude_used=exclude_used)
     OUTPUT_HTML.write_text(html, encoding="utf-8")
     print(f"HTML 已寫入: {OUTPUT_HTML}")
 
-    coupon_html = build_allmysteven_html(entries)
+    coupon_html = build_allmysteven_html(entries, exclude_used=exclude_used)
     OUTPUT_COUPON.write_text(coupon_html, encoding="utf-8")
     print(f"電子券清單已寫入: {OUTPUT_COUPON}")
 
-    txt_content = build_txt_url_list(entries)
+    txt_content = build_txt_url_list(entries, exclude_used=exclude_used)
     OUTPUT_TXT.write_text(txt_content, encoding="utf-8")
     print(f"網址清單已寫入: {OUTPUT_TXT}")
 
