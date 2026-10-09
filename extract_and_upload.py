@@ -120,7 +120,7 @@ def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False, refres
 
     - 新網址（不在快取）：一律連網檢查
     - force_refresh=False：已在快取的沿用，不重抓
-    - force_refresh=True 且 refresh_urls 有值：只重抓該集合內的網址
+    - force_refresh=True 且 refresh_urls 有值：重抓該集合，以及快取尚未標已兌換的全部舊券
     - force_refresh=True 且 refresh_urls is None：重抓全部（舊行為，慎用）
     - 例外：快取未標已兌換、但兌換期間已過 → 強制重查
       （避免像萊爾富純喫茶：實際已兌換卻仍顯示開啟／未換過）
@@ -138,12 +138,14 @@ def enrich_prizes_with_expiry(entries, verbose=True, force_refresh=False, refres
             in_cache = url in cache
             must_refresh = False
             if force_refresh:
-                if refresh_set is None or url in refresh_set:
-                    # 已兌換的不必每天重抓
-                    if in_cache and cache[url][1] == "已兌換":
-                        must_refresh = False
-                    else:
-                        must_refresh = True
+                already_used = in_cache and cache[url][1] == "已兌換"
+                in_recent = refresh_set is None or url in refresh_set
+                # 已兌換不必每天重抓。近 N 天以外、快取仍當可兌換的也要重查，
+                # 否則像 8 月領的蛋撻／漢堡用過後，到期前會一直掛在開啟清單。
+                if already_used:
+                    must_refresh = False
+                elif in_recent or in_cache:
+                    must_refresh = True
             # 快取以為還能用，但到期日已過 → 重查（可能其實已兌換）
             if in_cache and not must_refresh:
                 expiry_c, status_c = cache[url]
@@ -557,7 +559,7 @@ def main():
         recent_days = DEFAULT_RECENT_DAYS
 
     print("正在掃描 github 資料夾內的 Yahoo 序號查詢結果...")
-    # HTML／清單仍彙整全部歷史；連網重查只針對近 N 天
+    # HTML／清單彙整全部歷史。有 --refresh 時，尚未標已兌換的券每次都重查。
     entries = collect_all_prizes(days=None)
     if not entries:
         print("未找到任何「📱 發送到 Telegram 的獎品 📱」區塊。")
@@ -589,8 +591,7 @@ def main():
         enrich_refresh_urls = None
         if force_refresh:
             if recent_days:
-                print(f"重新檢查近 {recent_days} 天券狀態；其餘沿用快取；"
-                      f"到期未標已兌換會強制重查；新網址一律檢查...")
+                print("每次重查所有尚未標已兌換的券（含較早領的）；已兌換沿用快取...")
                 enrich_refresh_urls = refresh_urls if refresh_urls is not None else set()
             else:
                 print("正在重新爬取所有兌換券（含已使用狀態）...")
