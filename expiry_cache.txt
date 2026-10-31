@@ -717,6 +717,7 @@ https://txp.rs/viewvoucher.aspx?voucherguid=a7801c1a-f855-4cb0-a5b0-e7c71c60f64f
 https://txp.rs/viewvoucher.aspx?voucherguid=a7cc36ae-e4cf-4e43-b266-d14abd4feaf6	
 https://txp.rs/viewvoucher.aspx?voucherguid=a7d7d699-e117-4786-9e11-eac4441e1f88	2026.05.02	已兌換
 https://txp.rs/viewvoucher.aspx?voucherguid=a7f6f5a1-beab-49c4-b0ed-70cf12f1aaca	2026.05.23	已兌換
+https://txp.rs/viewvoucher.aspx?voucherguid=a81acce2-e383-4c65-8053-dcac16184a5c	2026.12.24
 https://txp.rs/viewvoucher.aspx?voucherguid=a8433f17-0ffc-4d1a-92f9-b385b327d376	2026.05.23	已兌換
 https://txp.rs/viewvoucher.aspx?voucherguid=a84f1481-cdb9-41c0-9546-8540065150eb	2026.05.23	已兌換
 https://txp.rs/viewvoucher.aspx?voucherguid=a860ed41-b965-4949-bb2c-f62925c2ef94	2026.05.23	已兌換
